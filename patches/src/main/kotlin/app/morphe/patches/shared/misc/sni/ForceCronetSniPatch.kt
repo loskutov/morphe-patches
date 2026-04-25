@@ -5,52 +5,42 @@ import app.morphe.patcher.patch.ResourcePatchBuilder
 import app.morphe.patcher.patch.resourcePatch
 import app.morphe.patcher.patch.stringOption
 import java.io.File
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
+import kotlin.math.abs
 
 private const val ARM64_DIR = "lib/arm64-v8a"
-private const val REPLACEMENT_HOST_SLOT = ".example.com"
 private const val DEFAULT_FORCED_SNI_HOST = "kek.bdn.dev"
+private const val HTTPS_PORT = 443
+private const val HOST_PORT_PAIR_SIZE = 0x20
+private const val HOST_PORT_PAIR_PORT_OFFSET = 0x00
+private const val HOST_PORT_PAIR_HOST_OFFSET = 0x08
+private const val SHORT_STRING_SIZE_OFFSET = HOST_PORT_PAIR_HOST_OFFSET + 0x17
+private const val MAX_SHORT_STRING_HOST_LENGTH = 22
 private val HOSTNAME_REGEX = Regex("^[A-Za-z0-9-]+(\\.[A-Za-z0-9-]+)+$")
-// Source-level context for the matched native block:
-// - Chromium net/socket/ssl_client_socket_impl.cc keeps the destination host in
-//   `SSLClientSocketImpl::host_and_port_` and later consumes it in `Init()` for
-//   `HostIsIPAddressNoBrackets(host_and_port_.host())` and
-//   `SSL_set_tlsext_host_name(ssl_.get(), host_and_port_.host().c_str())`.
-// - The broader goal here is to rewrite that stored host early enough that the
-//   same spoofed name is reused by later SSLClientSocketImpl paths, rather than
-//   only patching the single SSL_set_tlsext_host_name(...) call argument.
-//
-// The anchor below still keys off the original `c_str()` materialization right
-// before SSL_set_tlsext_host_name(...), then rewinds to replace the whole block.
-private const val HOST_OVERRIDE_BLOCK_START_DELTA = 0x34
-private const val HOST_OVERRIDE_BLOCK_LENGTH = 0x44
-private const val HOST_SETTER_CALL_DELTA = 0x0c
-private const val HOST_REPLACEMENT_CALL_DELTA = 0x20
-private const val NOP = 0xD503201F.toInt()
-private const val LDP_X1_X2_X0 = 0xA9400801.toInt()
-private const val STP_X1_X2_X19_0X128 = 0xA9128A61.toInt()
-private const val STRB_W8_X19_0X13F = 0x3904FE68.toInt()
-private const val LDR_X0_X19_0X108 = 0xF9408660.toInt()
-private const val ADD_X1_X19_0X128 = 0x9104A261.toInt()
 
-// The original anchor is the instruction triplet that materializes
-// `host_and_port_.host().c_str()` for SSL_set_tlsext_host_name(...).
-// We keep matching this location because it has been stable across the tested
-// Cronet builds and sits inside the same block that reads `host_and_port_`.
-private val SNI_FINGERPRINT_BYTES = byteArrayOf(
-    0x48,
-    0x00,
-    0xf8.toByte(),
-    0x36,
-    0x94.toByte(),
-    0x02,
-    0x40,
-    0xf9.toByte(),
-    0xe1.toByte(),
-    0x03,
-    0x14,
-    0xaa.toByte(),
+// Source-level context:
+// - SSLConnectJob::DoSSLConnect() first completes the nested TransportConnectJob
+//   and obtains a connected StreamSocket.
+// - It then calls CreateSSLClientSocket(..., std::move(nested_socket_),
+//   params_->host_and_port(), ssl_config).
+//
+// This is the clean boundary between the lower transport endpoint and the TLS
+// authentication hostname. The fingerprint below matches the call-site tail
+// where x3 is loaded with params_->host_and_port(). We only replace that x3
+// argument with a synthetic HostPortPair stored in an RX cave; the underlying
+// connected stream socket keeps using the original endpoint.
+private val TLS_HOST_ARGUMENT_FINGERPRINT_BYTES = byteArrayOf(
+    0x43, 0x61, 0x00, 0x91.toByte(), // add x3, x10, #0x18
+    0x08, 0x00, 0x40, 0xf9.toByte(), // ldr x8, [x0]
+    0x09, 0x11, 0x80.toByte(), 0xb9.toByte(), // ldrsw x9, [x8, #0x10]
+    0x08, 0x01, 0x09, 0x8b.toByte(), // add x8, x8, x9
+    0x00, 0x01, 0x3f, 0xd6.toByte(), // blr x8
 )
-private val REPLACEMENT_HOST_SLOT_BYTES = "$REPLACEMENT_HOST_SLOT\u0000".encodeToByteArray()
+
+private const val TLS_HOST_ARGUMENT_INSTRUCTION_OFFSET = 0
+private const val BRK_MASK = 0xffe0001f.toInt()
+private const val BRK_OPCODE = 0xd4200000.toInt()
 
 private fun ByteArray.findAll(needle: ByteArray): List<Int> {
     if (needle.isEmpty() || size < needle.size) return emptyList()
@@ -73,6 +63,157 @@ private fun ByteArray.findAll(needle: ByteArray): List<Int> {
     }
 
     return matches
+}
+
+private fun alignUp(value: Int, alignment: Int): Int {
+    return (value + alignment - 1) and -alignment
+}
+
+private fun ByteArray.readIntLE(offset: Int): Int {
+    return ByteBuffer.wrap(this, offset, Int.SIZE_BYTES)
+        .order(ByteOrder.LITTLE_ENDIAN)
+        .int
+}
+
+private fun decodeDirectBranchTarget(
+    instruction: Int,
+    instructionFileOffset: Int,
+    loadSegments: List<ElfLoadSegment>,
+): Int? {
+    // Check if instruction offset is within a PT_LOAD segment
+    val offsetLong = instructionFileOffset.toLong()
+    val isInLoadSegment = loadSegments.any { segment ->
+        offsetLong >= segment.fileOffset && offsetLong < segment.fileOffset + segment.fileSize
+    }
+    if (!isInLoadSegment) return null
+
+    val instructionVirtualAddress = fileOffsetToVirtualAddress(instructionFileOffset, loadSegments)
+
+    val targetVirtualAddress = when {
+        instruction ushr 26 == 0b000101 || instruction ushr 26 == 0b100101 -> {
+            var imm26 = instruction and 0x03ffffff
+            if ((imm26 and (1 shl 25)) != 0) {
+                imm26 = imm26 or (-1 shl 26)
+            }
+            instructionVirtualAddress + (imm26.toLong() shl 2)
+        }
+
+        instruction and 0xff000010.toInt() == 0x54000000 -> {
+            var imm19 = (instruction ushr 5) and 0x7ffff
+            if ((imm19 and (1 shl 18)) != 0) {
+                imm19 = imm19 or (-1 shl 19)
+            }
+            instructionVirtualAddress + (imm19.toLong() shl 2)
+        }
+
+        instruction and 0x7e000000 == 0x34000000 -> {
+            var imm19 = (instruction ushr 5) and 0x7ffff
+            if ((imm19 and (1 shl 18)) != 0) {
+                imm19 = imm19 or (-1 shl 19)
+            }
+            instructionVirtualAddress + (imm19.toLong() shl 2)
+        }
+
+        instruction and 0x7e000000 == 0x36000000 -> {
+            var imm14 = (instruction ushr 5) and 0x3fff
+            if ((imm14 and (1 shl 13)) != 0) {
+                imm14 = imm14 or (-1 shl 14)
+            }
+            instructionVirtualAddress + (imm14.toLong() shl 2)
+        }
+
+        else -> return null
+    }
+
+    return virtualAddressToFileOffset(targetVirtualAddress, loadSegments)
+}
+
+private fun collectDirectBranchTargets(
+    bytes: ByteArray,
+    loadSegments: List<ElfLoadSegment>,
+): Set<Int> {
+    val targets = mutableSetOf<Int>()
+    for (offset in 0..(bytes.size - Int.SIZE_BYTES) step Int.SIZE_BYTES) {
+        decodeDirectBranchTarget(bytes.readIntLE(offset), offset, loadSegments)?.let(targets::add)
+    }
+    return targets
+}
+
+private fun findSyntheticHostPortPairCave(
+    bytes: ByteArray,
+    patchOffset: Int,
+    loadSegments: List<ElfLoadSegment>,
+): Int {
+    val branchTargets = collectDirectBranchTargets(bytes, loadSegments)
+    val patchVirtualAddress = fileOffsetToVirtualAddress(patchOffset, loadSegments)
+
+    // First try the original BRK-based approach
+    for (offset in 0..(bytes.size - HOST_PORT_PAIR_SIZE - Int.SIZE_BYTES) step Int.SIZE_BYTES) {
+        val instruction = bytes.readIntLE(offset)
+        if (instruction and BRK_MASK != BRK_OPCODE) continue
+
+        val caveOffset = alignUp(offset + Int.SIZE_BYTES, Long.SIZE_BYTES)
+        if (caveOffset + HOST_PORT_PAIR_SIZE > bytes.size) continue
+
+        // Check if caveOffset is within a PT_LOAD segment before proceeding
+        val caveOffsetLong = caveOffset.toLong()
+        val isInLoadSegment = loadSegments.any { segment ->
+            caveOffsetLong >= segment.fileOffset && caveOffsetLong < segment.fileOffset + segment.fileSize
+        }
+        if (!isInLoadSegment) continue
+
+        val caveVirtualAddress = fileOffsetToVirtualAddress(caveOffset, loadSegments)
+        if (abs(caveVirtualAddress - patchVirtualAddress) >= (1L shl 20)) continue
+
+        val caveRange = caveOffset until caveOffset + HOST_PORT_PAIR_SIZE
+        if (branchTargets.any { it in caveRange }) continue
+
+        println("DEBUG: Found BRK-based cave at 0x${caveOffset.toString(16)}")
+        return caveOffset
+    }
+
+    // Fallback: look for any aligned location within PT_LOAD segments that's not a branch target
+    println("DEBUG: No BRK-based cave found, trying fallback approach")
+    for (segment in loadSegments) {
+        val segmentStart = segment.fileOffset.toInt()
+        val segmentEnd = (segment.fileOffset + segment.fileSize).toInt() - HOST_PORT_PAIR_SIZE
+
+        for (caveOffset in segmentStart..segmentEnd step 8) {  // Try 8-byte aligned positions
+            val caveVirtualAddress = fileOffsetToVirtualAddress(caveOffset, loadSegments)
+            if (abs(caveVirtualAddress - patchVirtualAddress) >= (1L shl 20)) continue
+
+            val caveRange = caveOffset until caveOffset + HOST_PORT_PAIR_SIZE
+            if (branchTargets.any { it in caveRange }) continue
+
+            // Check if this area looks like it might be padding/unused (all zeros or NOPs)
+            val isPadding = caveRange.all { offset ->
+                val value = if (offset + 3 < bytes.size) bytes.readIntLE(offset) else 0
+                value == 0 || value == 0xD503201F.toInt()  // NOP instruction
+            }
+
+            if (isPadding) {
+                println("DEBUG: Found padding-based cave at 0x${caveOffset.toString(16)}")
+                return caveOffset
+            }
+        }
+    }
+
+    throw PatchException("No suitable RX cave found for synthetic HostPortPair")
+}
+
+private fun buildSyntheticHostPortPair(host: String): ByteArray {
+    require(host.length <= MAX_SHORT_STRING_HOST_LENGTH) {
+        "Host '$host' is too long for libc++ short-string HostPortPair storage"
+    }
+
+    return ByteArray(HOST_PORT_PAIR_SIZE).also { bytes ->
+        val hostBytes = host.encodeToByteArray()
+        hostBytes.copyInto(bytes, destinationOffset = HOST_PORT_PAIR_HOST_OFFSET)
+        bytes[HOST_PORT_PAIR_HOST_OFFSET + hostBytes.size] = 0
+        bytes[SHORT_STRING_SIZE_OFFSET] = hostBytes.size.toByte()
+        bytes[HOST_PORT_PAIR_PORT_OFFSET] = (HTTPS_PORT and 0xff).toByte()
+        bytes[HOST_PORT_PAIR_PORT_OFFSET + 1] = ((HTTPS_PORT ushr 8) and 0xff).toByte()
+    }
 }
 
 private fun chooseCronetLibrary(arm64Dir: File): File? {
@@ -115,7 +256,12 @@ internal fun forceCronetSniPatch(
 
     execute {
         val forcedSniHostValue = forcedSniHost!!.trim()
-        val forcedSniHostBytes = "$forcedSniHostValue\u0000".encodeToByteArray()
+        if (forcedSniHostValue.length > MAX_SHORT_STRING_HOST_LENGTH) {
+            throw PatchException(
+                "Forced SNI host '$forcedSniHostValue' is too long. " +
+                        "Maximum supported length is $MAX_SHORT_STRING_HOST_LENGTH characters."
+            )
+        }
 
         val arm64Dir = get(ARM64_DIR)
         if (!arm64Dir.exists() || !arm64Dir.isDirectory) {
@@ -126,113 +272,47 @@ internal fun forceCronetSniPatch(
             ?: throw PatchException("No libcronet*.so found in '$ARM64_DIR'")
 
         val bytes = cronetLib.readBytes()
-        val expected = SNI_FINGERPRINT_BYTES
+        val loadSegments = parseElfLoadSegments(bytes)
+        val expected = TLS_HOST_ARGUMENT_FINGERPRINT_BYTES
 
         val patchOffsets = bytes.findAll(expected)
-        if (patchOffsets.size != 1) {
-            throw PatchException(
-                if (patchOffsets.isEmpty()) {
-                    "SNI fingerprint not found in ${cronetLib.name}."
-                } else {
-                    "SNI fingerprint matched multiple locations in ${cronetLib.name}: " +
-                            patchOffsets.joinToString { "0x${it.toString(16)}" }
-                }
-            )
+        if (patchOffsets.isEmpty()) {
+            throw PatchException("TLS host argument fingerprint not found in ${cronetLib.name}.")
+        }
+        if (patchOffsets.size > 1) {
+            println("WARNING: TLS host argument fingerprint matched multiple locations: " +
+                    patchOffsets.joinToString { "0x${it.toString(16)}" })
+            println("Using first match: 0x${patchOffsets.first().toString(16)}")
         }
 
-        val hostOffsets = bytes.findAll(REPLACEMENT_HOST_SLOT_BYTES)
-        if (hostOffsets.size != 1) {
-            throw PatchException(
-                if (hostOffsets.isEmpty()) {
-                    "Host string slot '$REPLACEMENT_HOST_SLOT' not found in ${cronetLib.name}"
-                } else {
-                    "Host string slot '$REPLACEMENT_HOST_SLOT' matched multiple locations in ${cronetLib.name}: " +
-                            hostOffsets.joinToString { "0x${it.toString(16)}" }
-                }
-            )
-        }
+        val patchOffset = patchOffsets.first() + TLS_HOST_ARGUMENT_INSTRUCTION_OFFSET
+        println("DEBUG: Using patch offset: 0x${patchOffset.toString(16)}")
 
-        val patchOffset = patchOffsets.single()
-        val hostOffset = hostOffsets.single()
-        val loadSegments = parseElfLoadSegments(bytes)
-        val patchStartOffset = patchOffset - HOST_OVERRIDE_BLOCK_START_DELTA
-        if (patchStartOffset < 0) {
-            throw PatchException("Patch start is out of bounds in ${cronetLib.name}")
-        }
-
-        val setterCallOffset = patchOffset + HOST_SETTER_CALL_DELTA
-        val setterVirtualAddress = decodeBlTargetVirtualAddress(
+        val caveOffset = findSyntheticHostPortPairCave(
             bytes = bytes,
-            instructionFileOffset = setterCallOffset,
-            segments = loadSegments,
-        ) ?: throw PatchException(
-            "Expected BL instruction at 0x${setterCallOffset.toString(16)} in ${cronetLib.name}"
+            patchOffset = patchOffset,
+            loadSegments = loadSegments,
         )
+        println("DEBUG: Found cave at offset: 0x${caveOffset.toString(16)}")
 
-        val patchStartVirtualAddress = fileOffsetToVirtualAddress(patchStartOffset, loadSegments)
-        val hostVirtualAddress = fileOffsetToVirtualAddress(hostOffset, loadSegments)
-        val hostLength = forcedSniHostValue.length
+        val caveVirtualAddress = fileOffsetToVirtualAddress(caveOffset, loadSegments)
+        val patchVirtualAddress = fileOffsetToVirtualAddress(patchOffset, loadSegments)
 
-        val adrpX0 = encodeAdrp(
-            register = 0,
-            instructionVirtualAddress = patchStartVirtualAddress,
-            targetVirtualAddress = hostVirtualAddress,
+        val syntheticHostPortPair = buildSyntheticHostPortPair(forcedSniHostValue)
+        println("DEBUG: Placing synthetic HostPortPair at 0x${caveOffset.toString(16)}: ${forcedSniHostValue}")
+        syntheticHostPortPair.copyInto(bytes, destinationOffset = caveOffset)
+
+        // Replace `add x3, x10, #0x18` (`params_->host_and_port()`) at the
+        // SSLConnectJob boundary with `adr x3, <synthetic HostPortPair>`. The
+        // nested StreamSocket has already connected to the original endpoint;
+        // only the TLS hostname argument is redirected.
+        val adrInstruction = encodeAdr(
+            register = 3,
+            instructionVirtualAddress = patchVirtualAddress,
+            targetVirtualAddress = caveVirtualAddress,
         )
-        val addX0X0 = encodeAddImmediate(
-            destinationRegister = 0,
-            sourceRegister = 0,
-            immediate = (hostVirtualAddress and 0xfff).toInt(),
-        )
-        val blSetter = encodeBl(
-            instructionVirtualAddress = patchStartVirtualAddress + HOST_REPLACEMENT_CALL_DELTA,
-            targetVirtualAddress = setterVirtualAddress,
-        )
-        val movW8HostLength = encodeMovz(
-            register = 8,
-            immediate = hostLength,
-            is64Bit = false,
-        )
-
-        if (forcedSniHostBytes.size > REPLACEMENT_HOST_SLOT_BYTES.size) {
-            throw PatchException(
-                "Replacement host '$forcedSniHostValue' does not fit in existing string slot for '$REPLACEMENT_HOST_SLOT'"
-            )
-        }
-
-        REPLACEMENT_HOST_SLOT_BYTES.indices.forEach { index ->
-            bytes[hostOffset + index] = 0
-        }
-        forcedSniHostBytes.copyInto(bytes, destinationOffset = hostOffset)
-
-        // Overwrite the inline libc++ short-string storage for
-        // `SSLClientSocketImpl::host_and_port_.host()` with the replacement SNI
-        // hostname before Init() reaches its hostname-dependent logic. The
-        // backing string literal itself is replaced in-place inside libcronet,
-        // reusing the existing `.example.com\0` slot because
-        // the configured hostname is expected to fit into that slot.
-        // before Init() reaches its hostname-dependent logic. The short-string
-        // size byte lives at +0x17 of the 24-byte std::string object, which is
-        // why we update `[x19 + 0x13f]` after copying the 16-byte payload.
-        val replacementWords = mutableListOf(
-            adrpX0,
-            addX0X0,
-            LDP_X1_X2_X0,
-            STP_X1_X2_X19_0X128,
-            movW8HostLength,
-            STRB_W8_X19_0X13F,
-            LDR_X0_X19_0X108,
-            ADD_X1_X19_0X128,
-            blSetter,
-        )
-        while (replacementWords.size * Int.SIZE_BYTES < HOST_OVERRIDE_BLOCK_LENGTH) {
-            replacementWords += NOP
-        }
-
-        val replacement = replacementWords
-            .flatMap { it.toLittleEndianBytes().asIterable() }
-            .toByteArray()
-
-        replacement.copyInto(bytes, destinationOffset = patchStartOffset)
+        println("DEBUG: Patching instruction at 0x${patchOffset.toString(16)}: 0x${adrInstruction.toString(16)}")
+        adrInstruction.toLittleEndianBytes().copyInto(bytes, destinationOffset = patchOffset)
 
         cronetLib.writeBytes(bytes)
     }

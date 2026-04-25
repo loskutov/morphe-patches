@@ -73,6 +73,40 @@ internal fun fileOffsetToVirtualAddress(
     return segment.virtualAddress + (offset - segment.fileOffset)
 }
 
+internal fun virtualAddressToFileOffset(
+    virtualAddress: Long,
+    segments: List<ElfLoadSegment>,
+): Int? {
+    val segment = segments.firstOrNull { candidate ->
+        virtualAddress >= candidate.virtualAddress &&
+                virtualAddress < candidate.virtualAddress + candidate.fileSize
+    } ?: return null
+
+    val offset = segment.fileOffset + (virtualAddress - segment.virtualAddress)
+    return offset.toInt()
+}
+
+internal fun encodeAdr(
+    register: Int,
+    instructionVirtualAddress: Long,
+    targetVirtualAddress: Long,
+): Int {
+    require(register in 0..31) { "Invalid ADR register: $register" }
+
+    val delta = targetVirtualAddress - instructionVirtualAddress
+    val minDelta = -(1 shl 20)
+    val maxDelta = (1 shl 20) - 1
+    if (delta < minDelta || delta > maxDelta) {
+        throw PatchException("ADR target delta out of range: $delta")
+    }
+
+    val imm21 = delta and 0x1fffff
+    val immlo = (imm21 and 0x3).toInt()
+    val immhi = ((imm21 shr 2) and 0x7ffff).toInt()
+
+    return 0x10000000 or (immlo shl 29) or (immhi shl 5) or register
+}
+
 internal fun encodeAdrp(
     register: Int,
     instructionVirtualAddress: Long,
