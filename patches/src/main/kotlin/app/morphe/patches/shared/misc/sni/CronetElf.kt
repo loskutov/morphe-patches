@@ -1,4 +1,4 @@
-package app.morphe.patches.youtube.misc.quic
+package app.morphe.patches.shared.misc.sni
 
 import app.morphe.patcher.patch.PatchException
 import java.nio.ByteBuffer

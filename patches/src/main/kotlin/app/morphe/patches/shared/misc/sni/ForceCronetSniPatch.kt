@@ -1,9 +1,9 @@
-package app.morphe.patches.youtube.misc.quic
+package app.morphe.patches.shared.misc.sni
 
 import app.morphe.patcher.patch.PatchException
+import app.morphe.patcher.patch.ResourcePatchBuilder
 import app.morphe.patcher.patch.resourcePatch
 import app.morphe.patcher.patch.stringOption
-import app.morphe.patches.youtube.shared.Constants.COMPATIBILITY_YOUTUBE
 import java.io.File
 
 private const val ARM64_DIR = "lib/arm64-v8a"
@@ -93,14 +93,15 @@ private fun chooseCronetLibrary(arm64Dir: File): File? {
     }
 }
 
-@Suppress("unused")
-val forceCronetSniBinaryPatch = resourcePatch(
+internal fun forceCronetSniPatch(
+    block: ResourcePatchBuilder.() -> Unit,
+) = resourcePatch(
     name = "Force Cronet SNI (arm64)",
     description = "Patches bundled arm64 libcronet so TLS SNI is forced to a configurable hostname in " +
             "the SSLClientSocket path. URL and HTTP Host remain unchanged.",
     default = false,
 ) {
-    compatibleWith(COMPATIBILITY_YOUTUBE)
+    block()
 
     val forcedSniHost by stringOption(
         key = "forcedSniHost",
