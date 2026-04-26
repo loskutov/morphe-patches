@@ -17,6 +17,12 @@ private const val HOST_PORT_PAIR_PORT_OFFSET = 0x00
 private const val HOST_PORT_PAIR_HOST_OFFSET = 0x08
 private const val SHORT_STRING_SIZE_OFFSET = HOST_PORT_PAIR_HOST_OFFSET + 0x17
 private const val MAX_SHORT_STRING_HOST_LENGTH = 22
+private const val ORIGINAL_SNI_HOST = "i.ytimg.com"
+private const val TRAMPOLINE_CODE_SIZE = 0x48
+private const val TRAMPOLINE_LITERAL_OFFSET = TRAMPOLINE_CODE_SIZE
+private const val TRAMPOLINE_SYNTHETIC_HOST_PORT_PAIR_OFFSET = TRAMPOLINE_LITERAL_OFFSET + Long.SIZE_BYTES
+private const val TRAMPOLINE_PAYLOAD_SIZE = TRAMPOLINE_SYNTHETIC_HOST_PORT_PAIR_OFFSET + HOST_PORT_PAIR_SIZE
+private const val ARM64_CONDITION_NE = 0x1
 private val HOSTNAME_REGEX = Regex("^[A-Za-z0-9-]+(\\.[A-Za-z0-9-]+)+$")
 
 // Source-level context:
@@ -139,7 +145,13 @@ private fun collectDirectBranchTargets(
     return targets
 }
 
-private fun findSyntheticHostPortPairCave(
+private fun isUnusedCaveWord(instruction: Int): Boolean {
+    return instruction == 0 ||
+            instruction == 0xd503201f.toInt() ||
+            instruction and BRK_MASK == BRK_OPCODE
+}
+
+private fun findTrampolineCave(
     bytes: ByteArray,
     patchOffset: Int,
     loadSegments: List<ElfLoadSegment>,
@@ -147,58 +159,33 @@ private fun findSyntheticHostPortPairCave(
     val branchTargets = collectDirectBranchTargets(bytes, loadSegments)
     val patchVirtualAddress = fileOffsetToVirtualAddress(patchOffset, loadSegments)
 
-    // First try the original BRK-based approach
-    for (offset in 0..(bytes.size - HOST_PORT_PAIR_SIZE - Int.SIZE_BYTES) step Int.SIZE_BYTES) {
-        val instruction = bytes.readIntLE(offset)
-        if (instruction and BRK_MASK != BRK_OPCODE) continue
+    for (segment in loadSegments.filter { it.isExecutable }) {
+        val segmentStart = alignUp(segment.fileOffset.toInt(), Int.SIZE_BYTES)
+        val segmentEnd = (segment.fileOffset + segment.fileSize).toInt() - TRAMPOLINE_PAYLOAD_SIZE
+        if (segmentStart > segmentEnd) continue
 
-        val caveOffset = alignUp(offset + Int.SIZE_BYTES, Long.SIZE_BYTES)
-        if (caveOffset + HOST_PORT_PAIR_SIZE > bytes.size) continue
+        for (offset in segmentStart..segmentEnd step Int.SIZE_BYTES) {
+            val caveOffset = alignUp(offset, Long.SIZE_BYTES)
+            if (caveOffset > segmentEnd) continue
 
-        // Check if caveOffset is within a PT_LOAD segment before proceeding
-        val caveOffsetLong = caveOffset.toLong()
-        val isInLoadSegment = loadSegments.any { segment ->
-            caveOffsetLong >= segment.fileOffset && caveOffsetLong < segment.fileOffset + segment.fileSize
-        }
-        if (!isInLoadSegment) continue
-
-        val caveVirtualAddress = fileOffsetToVirtualAddress(caveOffset, loadSegments)
-        if (abs(caveVirtualAddress - patchVirtualAddress) >= (1L shl 20)) continue
-
-        val caveRange = caveOffset until caveOffset + HOST_PORT_PAIR_SIZE
-        if (branchTargets.any { it in caveRange }) continue
-
-        println("DEBUG: Found BRK-based cave at 0x${caveOffset.toString(16)}")
-        return caveOffset
-    }
-
-    // Fallback: look for any aligned location within PT_LOAD segments that's not a branch target
-    println("DEBUG: No BRK-based cave found, trying fallback approach")
-    for (segment in loadSegments) {
-        val segmentStart = segment.fileOffset.toInt()
-        val segmentEnd = (segment.fileOffset + segment.fileSize).toInt() - HOST_PORT_PAIR_SIZE
-
-        for (caveOffset in segmentStart..segmentEnd step 8) {  // Try 8-byte aligned positions
             val caveVirtualAddress = fileOffsetToVirtualAddress(caveOffset, loadSegments)
-            if (abs(caveVirtualAddress - patchVirtualAddress) >= (1L shl 20)) continue
+            val branchDelta = caveVirtualAddress - patchVirtualAddress
+            if ((branchDelta and 0x3L) != 0L || abs(branchDelta shr 2) >= (1 shl 25)) continue
 
-            val caveRange = caveOffset until caveOffset + HOST_PORT_PAIR_SIZE
+            val caveRange = caveOffset until caveOffset + TRAMPOLINE_PAYLOAD_SIZE
             if (branchTargets.any { it in caveRange }) continue
 
-            // Check if this area looks like it might be padding/unused (all zeros or NOPs)
-            val isPadding = caveRange.all { offset ->
-                val value = if (offset + 3 < bytes.size) bytes.readIntLE(offset) else 0
-                value == 0 || value == 0xD503201F.toInt()  // NOP instruction
+            val isUnused = caveRange.step(Int.SIZE_BYTES).all { wordOffset ->
+                isUnusedCaveWord(bytes.readIntLE(wordOffset))
             }
+            if (!isUnused) continue
 
-            if (isPadding) {
-                println("DEBUG: Found padding-based cave at 0x${caveOffset.toString(16)}")
-                return caveOffset
-            }
+            println("DEBUG: Found executable trampoline cave at 0x${caveOffset.toString(16)}")
+            return caveOffset
         }
     }
 
-    throw PatchException("No suitable RX cave found for synthetic HostPortPair")
+    throw PatchException("No suitable executable RX cave found for conditional SNI trampoline")
 }
 
 private fun buildSyntheticHostPortPair(host: String): ByteArray {
@@ -214,6 +201,52 @@ private fun buildSyntheticHostPortPair(host: String): ByteArray {
         bytes[HOST_PORT_PAIR_PORT_OFFSET] = (HTTPS_PORT and 0xff).toByte()
         bytes[HOST_PORT_PAIR_PORT_OFFSET + 1] = ((HTTPS_PORT ushr 8) and 0xff).toByte()
     }
+}
+
+private fun ByteArray.writeInstruction(offset: Int, instruction: Int) {
+    instruction.toLittleEndianBytes().copyInto(this, destinationOffset = offset)
+}
+
+private fun buildConditionalSniTrampoline(
+    caveVirtualAddress: Long,
+    returnVirtualAddress: Long,
+    syntheticHostPortPair: ByteArray,
+): ByteArray {
+    val originalHostBytes = ORIGINAL_SNI_HOST.encodeToByteArray()
+    check(originalHostBytes.size == 11) { "Unexpected ORIGINAL_SNI_HOST length" }
+
+    val payload = ByteArray(TRAMPOLINE_PAYLOAD_SIZE)
+    val forcedPathOffset = 0x40
+    val forcedPathVirtualAddress = caveVirtualAddress + forcedPathOffset
+    val literalVirtualAddress = caveVirtualAddress + TRAMPOLINE_LITERAL_OFFSET
+    val syntheticHostPortPairVirtualAddress = caveVirtualAddress + TRAMPOLINE_SYNTHETIC_HOST_PORT_PAIR_OFFSET
+
+    fun instructionVirtualAddress(offset: Int) = caveVirtualAddress + offset
+
+    // x10 is already the SSLConnectJob params pointer at the original call-site.
+    // x3 must contain params_->host_and_port() unless we choose the synthetic SNI pair.
+    payload.writeInstruction(0x00, encodeAddImmediate(3, 10, 0x18))
+    payload.writeInstruction(0x04, encodeLdrUnsignedImmediate(11, 3, SHORT_STRING_SIZE_OFFSET, sizeBytes = 1))
+    payload.writeInstruction(0x08, encodeCmpImmediate(11, originalHostBytes.size, is64Bit = false))
+    payload.writeInstruction(0x0c, encodeConditionalBranch(instructionVirtualAddress(0x0c), forcedPathVirtualAddress, ARM64_CONDITION_NE))
+    payload.writeInstruction(0x10, encodeLdrUnsignedImmediate(11, 3, HOST_PORT_PAIR_HOST_OFFSET, sizeBytes = 8))
+    payload.writeInstruction(0x14, encodeLdrLiteral(12, instructionVirtualAddress(0x14), literalVirtualAddress, is64Bit = true))
+    payload.writeInstruction(0x18, encodeEorShiftedRegister(11, 11, 12, is64Bit = true))
+    payload.writeInstruction(0x1c, encodeCbnz(11, instructionVirtualAddress(0x1c), forcedPathVirtualAddress, is64Bit = true))
+    payload.writeInstruction(0x20, encodeLdrUnsignedImmediate(11, 3, HOST_PORT_PAIR_HOST_OFFSET + 8, sizeBytes = 2))
+    payload.writeInstruction(0x24, encodeMovz(12, 0x6f63, is64Bit = false))
+    payload.writeInstruction(0x28, encodeCmpShiftedRegister(11, 12, is64Bit = false))
+    payload.writeInstruction(0x2c, encodeConditionalBranch(instructionVirtualAddress(0x2c), forcedPathVirtualAddress, ARM64_CONDITION_NE))
+    payload.writeInstruction(0x30, encodeLdrUnsignedImmediate(11, 3, HOST_PORT_PAIR_HOST_OFFSET + 10, sizeBytes = 1))
+    payload.writeInstruction(0x34, encodeCmpImmediate(11, 'm'.code, is64Bit = false))
+    payload.writeInstruction(0x38, encodeConditionalBranch(instructionVirtualAddress(0x38), forcedPathVirtualAddress, ARM64_CONDITION_NE))
+    payload.writeInstruction(0x3c, encodeB(instructionVirtualAddress(0x3c), returnVirtualAddress))
+    payload.writeInstruction(0x40, encodeAdr(3, instructionVirtualAddress(0x40), syntheticHostPortPairVirtualAddress))
+    payload.writeInstruction(0x44, encodeB(instructionVirtualAddress(0x44), returnVirtualAddress))
+
+    originalHostBytes.copyInto(payload, destinationOffset = TRAMPOLINE_LITERAL_OFFSET, endIndex = 8)
+    syntheticHostPortPair.copyInto(payload, destinationOffset = TRAMPOLINE_SYNTHETIC_HOST_PORT_PAIR_OFFSET)
+    return payload
 }
 
 private fun chooseCronetLibrary(arm64Dir: File): File? {
@@ -288,7 +321,7 @@ internal fun forceCronetSniPatch(
         val patchOffset = patchOffsets.first() + TLS_HOST_ARGUMENT_INSTRUCTION_OFFSET
         println("DEBUG: Using patch offset: 0x${patchOffset.toString(16)}")
 
-        val caveOffset = findSyntheticHostPortPairCave(
+        val caveOffset = findTrampolineCave(
             bytes = bytes,
             patchOffset = patchOffset,
             loadSegments = loadSegments,
@@ -299,20 +332,29 @@ internal fun forceCronetSniPatch(
         val patchVirtualAddress = fileOffsetToVirtualAddress(patchOffset, loadSegments)
 
         val syntheticHostPortPair = buildSyntheticHostPortPair(forcedSniHostValue)
-        println("DEBUG: Placing synthetic HostPortPair at 0x${caveOffset.toString(16)}: ${forcedSniHostValue}")
-        syntheticHostPortPair.copyInto(bytes, destinationOffset = caveOffset)
+        val trampoline = buildConditionalSniTrampoline(
+            caveVirtualAddress = caveVirtualAddress,
+            returnVirtualAddress = patchVirtualAddress + Int.SIZE_BYTES,
+            syntheticHostPortPair = syntheticHostPortPair,
+        )
+        println(
+            "DEBUG: Placing conditional SNI trampoline at 0x${caveOffset.toString(16)}; " +
+                    "leaving original SNI for $ORIGINAL_SNI_HOST and forcing $forcedSniHostValue otherwise"
+        )
+        trampoline.copyInto(bytes, destinationOffset = caveOffset)
 
         // Replace `add x3, x10, #0x18` (`params_->host_and_port()`) at the
-        // SSLConnectJob boundary with `adr x3, <synthetic HostPortPair>`. The
-        // nested StreamSocket has already connected to the original endpoint;
-        // only the TLS hostname argument is redirected.
-        val adrInstruction = encodeAdr(
-            register = 3,
+        // SSLConnectJob boundary with a branch to a trampoline. The trampoline
+        // keeps `i.ytimg.com` on the original HostPortPair and redirects all
+        // other TLS hostnames to the synthetic pair. The nested StreamSocket has
+        // already connected to the original endpoint, so the transport endpoint
+        // and HTTP Host remain unchanged.
+        val branchInstruction = encodeB(
             instructionVirtualAddress = patchVirtualAddress,
             targetVirtualAddress = caveVirtualAddress,
         )
-        println("DEBUG: Patching instruction at 0x${patchOffset.toString(16)}: 0x${adrInstruction.toString(16)}")
-        adrInstruction.toLittleEndianBytes().copyInto(bytes, destinationOffset = patchOffset)
+        println("DEBUG: Patching instruction at 0x${patchOffset.toString(16)}: 0x${branchInstruction.toString(16)}")
+        branchInstruction.toLittleEndianBytes().copyInto(bytes, destinationOffset = patchOffset)
 
         cronetLib.writeBytes(bytes)
     }

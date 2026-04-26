@@ -8,7 +8,11 @@ internal data class ElfLoadSegment(
     val fileOffset: Long,
     val fileSize: Long,
     val virtualAddress: Long,
+    val flags: Int,
 )
+
+internal val ElfLoadSegment.isExecutable: Boolean
+    get() = flags and 0x1 != 0
 
 internal fun parseElfLoadSegments(bytes: ByteArray): List<ElfLoadSegment> {
     if (bytes.size < 0x40) {
@@ -42,6 +46,7 @@ internal fun parseElfLoadSegments(bytes: ByteArray): List<ElfLoadSegment> {
         val type = bb.getInt(base)
         if (type != 1) return@repeat
 
+        val flags = bb.getInt(base + 0x04)
         val fileOffset = bb.getLong(base + 0x08)
         val virtualAddress = bb.getLong(base + 0x10)
         val fileSize = bb.getLong(base + 0x20)
@@ -50,6 +55,7 @@ internal fun parseElfLoadSegments(bytes: ByteArray): List<ElfLoadSegment> {
                 fileOffset = fileOffset,
                 fileSize = fileSize,
                 virtualAddress = virtualAddress,
+                flags = flags,
             )
         }
     }
@@ -156,6 +162,160 @@ internal fun encodeMovz(
 
     val base = if (is64Bit) 0xD2800000.toInt() else 0x52800000
     return base or (immediate shl 5) or register
+}
+
+internal fun encodeB(
+    instructionVirtualAddress: Long,
+    targetVirtualAddress: Long,
+): Int {
+    val delta = targetVirtualAddress - instructionVirtualAddress
+    if ((delta and 0x3L) != 0L) {
+        throw PatchException("B target delta is not instruction-aligned: $delta")
+    }
+
+    val imm26 = delta shr 2
+    val minDelta = -(1 shl 25)
+    val maxDelta = (1 shl 25) - 1
+    if (imm26 < minDelta || imm26 > maxDelta) {
+        throw PatchException("B target delta out of range: $delta")
+    }
+
+    return 0x14000000 or (imm26.toInt() and 0x03ffffff)
+}
+
+internal fun encodeConditionalBranch(
+    instructionVirtualAddress: Long,
+    targetVirtualAddress: Long,
+    condition: Int,
+): Int {
+    require(condition in 0..0xf) { "Invalid condition: $condition" }
+
+    val delta = targetVirtualAddress - instructionVirtualAddress
+    if ((delta and 0x3L) != 0L) {
+        throw PatchException("B.cond target delta is not instruction-aligned: $delta")
+    }
+
+    val imm19 = delta shr 2
+    val minDelta = -(1 shl 18)
+    val maxDelta = (1 shl 18) - 1
+    if (imm19 < minDelta || imm19 > maxDelta) {
+        throw PatchException("B.cond target delta out of range: $delta")
+    }
+
+    return 0x54000000 or ((imm19.toInt() and 0x7ffff) shl 5) or condition
+}
+
+internal fun encodeLdrUnsignedImmediate(
+    destinationRegister: Int,
+    baseRegister: Int,
+    immediate: Int,
+    sizeBytes: Int,
+): Int {
+    require(destinationRegister in 0..31) { "Invalid LDR destination register: $destinationRegister" }
+    require(baseRegister in 0..31) { "Invalid LDR base register: $baseRegister" }
+    require(immediate >= 0) { "LDR immediate out of range: $immediate" }
+    require(sizeBytes == 1 || sizeBytes == 2 || sizeBytes == 4 || sizeBytes == 8) {
+        "Invalid LDR size: $sizeBytes"
+    }
+    require(immediate % sizeBytes == 0) { "LDR immediate is not scaled-aligned: $immediate" }
+
+    val scaledImmediate = immediate / sizeBytes
+    require(scaledImmediate in 0..0xfff) { "LDR immediate out of range: $immediate" }
+
+    val base = when (sizeBytes) {
+        1 -> 0x39400000
+        2 -> 0x79400000
+        4 -> 0xb9400000.toInt()
+        else -> 0xf9400000.toInt()
+    }
+
+    return base or (scaledImmediate shl 10) or (baseRegister shl 5) or destinationRegister
+}
+
+internal fun encodeLdrLiteral(
+    destinationRegister: Int,
+    instructionVirtualAddress: Long,
+    targetVirtualAddress: Long,
+    is64Bit: Boolean,
+): Int {
+    require(destinationRegister in 0..31) { "Invalid LDR literal destination register: $destinationRegister" }
+
+    val delta = targetVirtualAddress - instructionVirtualAddress
+    if ((delta and 0x3L) != 0L) {
+        throw PatchException("LDR literal target delta is not instruction-aligned: $delta")
+    }
+
+    val imm19 = delta shr 2
+    val minDelta = -(1 shl 18)
+    val maxDelta = (1 shl 18) - 1
+    if (imm19 < minDelta || imm19 > maxDelta) {
+        throw PatchException("LDR literal target delta out of range: $delta")
+    }
+
+    val base = if (is64Bit) 0x58000000 else 0x18000000
+    return base or ((imm19.toInt() and 0x7ffff) shl 5) or destinationRegister
+}
+
+internal fun encodeEorShiftedRegister(
+    destinationRegister: Int,
+    leftRegister: Int,
+    rightRegister: Int,
+    is64Bit: Boolean,
+): Int {
+    require(destinationRegister in 0..31) { "Invalid EOR destination register: $destinationRegister" }
+    require(leftRegister in 0..31) { "Invalid EOR left register: $leftRegister" }
+    require(rightRegister in 0..31) { "Invalid EOR right register: $rightRegister" }
+
+    val base = if (is64Bit) 0xca000000.toInt() else 0x4a000000
+    return base or (rightRegister shl 16) or (leftRegister shl 5) or destinationRegister
+}
+
+internal fun encodeCbnz(
+    register: Int,
+    instructionVirtualAddress: Long,
+    targetVirtualAddress: Long,
+    is64Bit: Boolean,
+): Int {
+    require(register in 0..31) { "Invalid CBNZ register: $register" }
+
+    val delta = targetVirtualAddress - instructionVirtualAddress
+    if ((delta and 0x3L) != 0L) {
+        throw PatchException("CBNZ target delta is not instruction-aligned: $delta")
+    }
+
+    val imm19 = delta shr 2
+    val minDelta = -(1 shl 18)
+    val maxDelta = (1 shl 18) - 1
+    if (imm19 < minDelta || imm19 > maxDelta) {
+        throw PatchException("CBNZ target delta out of range: $delta")
+    }
+
+    val base = if (is64Bit) 0xb5000000.toInt() else 0x35000000
+    return base or ((imm19.toInt() and 0x7ffff) shl 5) or register
+}
+
+internal fun encodeCmpImmediate(
+    register: Int,
+    immediate: Int,
+    is64Bit: Boolean,
+): Int {
+    require(register in 0..31) { "Invalid CMP register: $register" }
+    require(immediate in 0..0xfff) { "CMP immediate out of range: $immediate" }
+
+    val base = if (is64Bit) 0xf100001f.toInt() else 0x7100001f
+    return base or (immediate shl 10) or (register shl 5)
+}
+
+internal fun encodeCmpShiftedRegister(
+    leftRegister: Int,
+    rightRegister: Int,
+    is64Bit: Boolean,
+): Int {
+    require(leftRegister in 0..31) { "Invalid CMP left register: $leftRegister" }
+    require(rightRegister in 0..31) { "Invalid CMP right register: $rightRegister" }
+
+    val base = if (is64Bit) 0xeb00001f.toInt() else 0x6b00001f
+    return base or (rightRegister shl 16) or (leftRegister shl 5)
 }
 
 internal fun decodeBlTargetVirtualAddress(
